@@ -101,7 +101,6 @@ static UsefulBuf _cbor_cert_chain(UsefulBuf buf, size_t num, UsefulBufC *certs)
 	QCBOREncode_Init(&ctx, buf);
 
 	QCBOREncode_OpenMap(&ctx);
-		QCBOREncode_AddUInt64ToMap(&ctx, "num_certs", num);
 		QCBOREncode_OpenArrayInMap(&ctx, "certs");
 		for (size_t i = 0; i < num; i++)
 			QCBOREncode_AddBytes(&ctx, certs[i]);
@@ -154,7 +153,7 @@ static void coap_cert_chain_handler(struct coap_resource_t* resource,
 					   in,
 					   out,
 					   query,
-					   COAP_MEDIATYPE_APPLICATION_OCTET_STREAM,
+					   COAP_MEDIATYPE_APPLICATION_CBOR,
 					   -1,
 					   0,
 					   ub.len,
@@ -170,9 +169,9 @@ void add_resource_wrapper(struct coap_context_t* coap_context,
 			  coap_request_t method, const char* resource_name,
 			  coap_method_handler_t handler)
 {
+	coap_str_const_t* resource_uri = coap_new_str_const((uint8_t const*)resource_name, strlen(resource_name));
 	coap_resource_t* resource =
-		coap_resource_init(coap_make_str_const(resource_name),
-				   COAP_RESOURCE_FLAGS_RELEASE_URI);
+		coap_resource_init(resource_uri, COAP_RESOURCE_FLAGS_RELEASE_URI);
 	coap_register_handler(resource, method, handler);
 	coap_add_resource(coap_context, resource);
 }
