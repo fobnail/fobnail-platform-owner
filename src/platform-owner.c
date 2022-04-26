@@ -8,13 +8,22 @@
 #include <signal.h>
 #include <qcbor/UsefulBuf.h>
 #include <qcbor/qcbor_encode.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <openssl/safestack.h>
 
 static volatile sig_atomic_t quit = 0;
 static const char LISTEN_ADDRESS[] = "0.0.0.0";
 static unsigned int port = COAP_DEFAULT_PORT; /* default port 5683 */
-static char *chain_filename = NULL;
+static X509_NAME *issuer_name = NULL;
+
+struct {
+	char *chain_filename;
+	char *po_priv_filename;
+} args;
 
 static void signal_handler(int signum)
 {
@@ -35,14 +44,15 @@ static int get_cert_chain(UsefulBufC **certs)
 	X509_STORE *store = NULL;
 	X509_LOOKUP *lookup_ctx = NULL;
 	STACK_OF(X509_OBJECT) *chain = NULL;
+	X509_NAME *xn_cur = NULL, *xn_prev = NULL;
 
 	/* TODO: add error checking for openssl calls */
 	store = X509_STORE_new();
 	lookup_ctx = X509_STORE_add_lookup(store, X509_LOOKUP_file());
 
-	if (!X509_LOOKUP_load_file(lookup_ctx, chain_filename, X509_FILETYPE_PEM)) {
+	if (!X509_LOOKUP_load_file(lookup_ctx, args.chain_filename, X509_FILETYPE_PEM)) {
 		fprintf(stderr, "Can't load certificates from '%s' - is file corrupted?\n",
-			chain_filename);
+			args.chain_filename);
 		goto error;
 	}
 
@@ -53,6 +63,7 @@ static int get_cert_chain(UsefulBufC **certs)
 
 	for (int i = 0; i < num_objects; i++) {
 		int len;
+		int ca = 0;
 		unsigned char *buf = NULL;
 		X509 *cert = NULL;
 
@@ -64,6 +75,18 @@ static int get_cert_chain(UsefulBufC **certs)
 			continue;
 		}
 
+		ca = X509_check_ca(cert);
+		if (ca == 0) {
+			/* Can't be used for signing other certificates */
+			fprintf(stderr, "Object with index %d is not a CA certificate!\n", i);
+			continue;
+		}
+
+		if (ca != 1) {
+			/* Can be used for signing, but doesn't have proper format */
+			fprintf(stderr, "Object with index %d is not a X509v3 CA certificate!\n", i);
+		}
+
 		/* Convert to DER */
 		len = i2d_X509(cert, &buf);
 		if (len < 0) {
@@ -71,11 +94,16 @@ static int get_cert_chain(UsefulBufC **certs)
 			goto error;
 		}
 
+		xn_prev = xn_cur;
+		xn_cur = X509_get_subject_name(cert);
+
 		/* Save pointers to DER certificates in returned array */
 		(*certs)[chain_size].len = len;
 		(*certs)[chain_size].ptr = buf;
 		chain_size++;
 	}
+
+	issuer_name = X509_NAME_dup(xn_prev);
 
 error:
 	/* Tear down X509 resources */
@@ -134,6 +162,149 @@ static UsefulBuf cbor_cert_chain(void)
 	return ret;
 }
 
+static void add_serial(X509 *x509)
+{
+	/* FIXME: this should not be random, CA must keep track of certificates
+	 * it issues
+	 */
+	BIGNUM *bn = NULL;
+	unsigned char rnd[20];
+	RAND_bytes(rnd, 20);
+	bn = BN_bin2bn(rnd, 20, NULL);
+	X509_set_serialNumber(x509, BN_to_ASN1_INTEGER(bn, NULL));
+	BN_free(bn);
+}
+
+static void add_basic_constraints(X509 *x509)
+{
+	/* TODO */
+	(void)x509;
+}
+
+static void add_key_usage(X509 *x509)
+{
+	/* TODO */
+	(void)x509;
+}
+
+static ASN1_OCTET_STRING *get_keyid(X509_PUBKEY *pubkey)
+{
+	const unsigned char *pk = NULL;
+	int pklen;
+	unsigned diglen;
+	unsigned char pkey_dig[EVP_MAX_MD_SIZE];
+	ASN1_OCTET_STRING *oct = NULL;
+
+	X509_PUBKEY_get0_param(NULL, &pk, &pklen, NULL, pubkey);
+
+	EVP_Digest(pk, pklen, pkey_dig, &diglen, EVP_sha1(), NULL);
+
+	oct = ASN1_OCTET_STRING_new();
+	ASN1_OCTET_STRING_set(oct, pkey_dig, diglen);
+
+	return oct;
+}
+
+static void add_skid(X509 *x509)
+{
+	ASN1_OCTET_STRING *oct = NULL, *ext_oct = NULL;
+	X509_EXTENSION *ext = NULL;
+	X509_PUBKEY *pubkey = NULL;
+
+	/* 'pubkey' will point to somewhere inside 'x509', must not be freed */
+	pubkey = X509_get_X509_PUBKEY(x509);
+	oct = get_keyid(pubkey);
+
+	ext_oct = ASN1_OCTET_STRING_new();
+	ext_oct->length = i2d_ASN1_OCTET_STRING(oct, &ext_oct->data);
+
+	ext = X509_EXTENSION_create_by_NID(NULL, NID_subject_key_identifier, 0,
+					   ext_oct);
+	X509_add_ext(x509, ext, X509_get_ext_count(x509));
+
+	X509_EXTENSION_free(ext);
+	ASN1_OCTET_STRING_free(ext_oct);
+	ASN1_OCTET_STRING_free(oct);
+}
+
+static void add_akid(X509 *x509, EVP_PKEY *ak_priv)
+{
+	ASN1_OCTET_STRING *ext_oct = NULL;
+	X509_EXTENSION *ext = NULL;
+	X509_PUBKEY *pubkey = NULL;
+	AUTHORITY_KEYID akid = {0};
+
+	/* New 'pubkey' is created, must be freed */
+	X509_PUBKEY_set(&pubkey, ak_priv);
+	akid.keyid = get_keyid(pubkey);
+
+	ext_oct = ASN1_OCTET_STRING_new();
+	ext_oct->length = i2d_AUTHORITY_KEYID(&akid, &ext_oct->data);
+
+	ext = X509_EXTENSION_create_by_NID(NULL, NID_authority_key_identifier,
+					   0, ext_oct);
+	X509_add_ext(x509, ext, X509_get_ext_count(x509));
+
+	X509_EXTENSION_free(ext);
+	ASN1_OCTET_STRING_free(ext_oct);
+	ASN1_OCTET_STRING_free(akid.keyid);
+	X509_PUBKEY_free(pubkey);
+}
+
+/* TODO: change csr_filename to UsefulBuf with DER */
+static void create_cert(const char *csr_filename, long days)
+{
+	EVP_PKEY *pkey;
+	X509_REQ *req;
+	ASN1_TIME *tm;
+
+	FILE *csr = fopen(csr_filename, "r");
+	if (csr == NULL) {
+		perror("Can't open CSR file");
+		return;
+	}
+
+	FILE *po_priv = fopen(args.po_priv_filename, "r");
+	if (po_priv == NULL) {
+		perror("Can't open private CA key file");
+		return;
+	}
+
+	pkey = PEM_read_PrivateKey(po_priv, NULL, NULL, NULL);
+	req = PEM_read_X509_REQ(csr, NULL, NULL, NULL);
+	/* Note: pointer to buf is modified, make a copy */
+	//req = d2i_X509_REQ(NULL, &buf, len);
+
+	X509 *ret = X509_new();
+	X509_set_version(ret, 2);
+	X509_NAME *xn = X509_REQ_get_subject_name(req);
+	X509_set_subject_name(ret, xn);
+	X509_set_issuer_name(ret, issuer_name);
+	tm = ASN1_TIME_adj(NULL, time(NULL), 0, 0);
+	X509_set1_notBefore(ret, tm);
+	tm = ASN1_TIME_adj(tm, time(NULL), days, 0);
+	X509_set1_notAfter(ret, tm);
+	ASN1_STRING_free(tm);
+
+	X509_set_pubkey(ret, X509_REQ_get0_pubkey(req));
+
+	add_serial(ret);
+
+	add_basic_constraints(ret);
+	add_key_usage(ret);
+	add_skid(ret);
+	add_akid(ret, pkey);
+
+	/* TODO: blindly issuing certificates might be dangerous, add tests */
+	X509_sign(ret, pkey, EVP_sha256());
+
+	/* Following line won't even get called when error happens earlier */
+	ERR_print_errors_fp(stdout);
+
+	PEM_write_X509(stdout, ret);
+	X509_free(ret);
+}
+
 static void coap_cert_chain_handler(struct coap_resource_t* resource,
 				    struct coap_session_t* session,
 				    const struct coap_pdu_t* in,
@@ -145,6 +316,9 @@ static void coap_cert_chain_handler(struct coap_resource_t* resource,
 	printf("Received message: %s\n", coap_get_uri_path(in)->s);
 
 	UsefulBuf ub = cbor_cert_chain();
+
+	/* For testing only - normally won't be here */
+	create_cert("../tmp/test3.pem", 365);
 
 	/* prepare and send response */
 	coap_pdu_set_code(out, COAP_RESPONSE_CODE_CONTENT);
@@ -199,19 +373,29 @@ int main(int argc, char *argv[])
 	int result = EXIT_SUCCESS;
 
 	/* TODO: parse CLI arguments with getopt if needed */
-	if (argc < 2) {
-		printf("Usage: %s path/to/cert_chain.pem\n", argv[0]);
+	if (argc < 3) {
+		printf("Usage: %s path/to/cert_chain.pem path/to/po_priv_key.pem\n", argv[0]);
 		return EXIT_FAILURE;
 	}
 
 	FILE *f = fopen(argv[1], "r");
 	if (f == NULL) {
 		perror("fopen() failed");
-		printf("Usage: %s path/to/cert_chain.pem\n", argv[0]);
+		printf("Usage: %s path/to/cert_chain.pem path/to/po_priv_key.pem\n", argv[0]);
 		return EXIT_FAILURE;
 	} else {
 		fclose(f);
-		chain_filename = argv[1];
+		args.chain_filename = argv[1];
+	}
+
+	f = fopen(argv[2], "r");
+	if (f == NULL) {
+		perror("fopen() failed");
+		printf("Usage: %s path/to/cert_chain.pem path/to/po_priv_key.pem\n", argv[0]);
+		return EXIT_FAILURE;
+	} else {
+		fclose(f);
+		args.po_priv_filename = argv[2];
 	}
 
 	/* signal handling */
@@ -255,6 +439,9 @@ int main(int argc, char *argv[])
 	}
 
 error:
+	if (issuer_name)
+		X509_NAME_free(issuer_name);
+
 	/* free CoAP memory */
 	coap_free_endpoint(coap_endpoint);
 	coap_endpoint = NULL;
