@@ -37,6 +37,14 @@ static void coap_free_wrapper(coap_session_t *session, void *app_ptr)
 		free(app_ptr);
 }
 
+static void coap_OPENSSL_free_wrapper(coap_session_t *session, void *app_ptr)
+{
+	(void)session; /* unused */
+	UsefulBuf *ub = app_ptr;
+	if (ub->ptr != NULL)
+		OPENSSL_clear_free(ub->ptr, ub->len);
+}
+
 static int get_cert_chain(UsefulBufC **certs)
 {
 	int num_objects = 0;
@@ -251,29 +259,26 @@ static void add_akid(X509 *x509, EVP_PKEY *ak_priv)
 	X509_PUBKEY_free(pubkey);
 }
 
-/* TODO: change csr_filename to UsefulBuf with DER */
-static void create_cert(const char *csr_filename, long days)
+static UsefulBuf create_cert(UsefulBuf csr, long days)
 {
 	EVP_PKEY *pkey;
 	X509_REQ *req;
 	ASN1_TIME *tm;
-
-	FILE *csr = fopen(csr_filename, "r");
-	if (csr == NULL) {
-		perror("Can't open CSR file");
-		return;
-	}
+	UsefulBuf ub = NULLUsefulBuf;
+	/* Pointer to buffer is modified by d2i_* functions, make a copy */
+	unsigned char *tmp_ptr = csr.ptr;
+	/* UsefulBuf.len is unsigned and i2d_* return negative value on error */
+	int len = 0;
 
 	FILE *po_priv = fopen(args.po_priv_filename, "r");
 	if (po_priv == NULL) {
 		perror("Can't open private CA key file");
-		return;
+		return NULLUsefulBuf;
 	}
 
 	pkey = PEM_read_PrivateKey(po_priv, NULL, NULL, NULL);
-	req = PEM_read_X509_REQ(csr, NULL, NULL, NULL);
-	/* Note: pointer to buf is modified, make a copy */
-	//req = d2i_X509_REQ(NULL, &buf, len);
+
+	req = d2i_X509_REQ(NULL, (const unsigned char **)&tmp_ptr, csr.len);
 
 	X509 *ret = X509_new();
 	X509_set_version(ret, 2);
@@ -301,8 +306,22 @@ static void create_cert(const char *csr_filename, long days)
 	/* Following line won't even get called when error happens earlier */
 	ERR_print_errors_fp(stdout);
 
+	/* TODO: for testing only, remove when no longer needed */
 	PEM_write_X509(stdout, ret);
+
+	tmp_ptr = NULL;
+	len = i2d_X509(ret, &tmp_ptr);
+	if (len < 0) {
+		fprintf(stderr, "i2d_X509() returned error: %d\n", len);
+	} else {
+		ub.ptr = tmp_ptr;
+		ub.len = len;
+	}
+
 	X509_free(ret);
+	fclose(po_priv);
+
+	return ub;
 }
 
 static void coap_cert_chain_handler(struct coap_resource_t* resource,
@@ -316,9 +335,6 @@ static void coap_cert_chain_handler(struct coap_resource_t* resource,
 	printf("Received message: %s\n", coap_get_uri_path(in)->s);
 
 	UsefulBuf ub = cbor_cert_chain();
-
-	/* For testing only - normally won't be here */
-	create_cert("../tmp/test3.pem", 365);
 
 	/* prepare and send response */
 	coap_pdu_set_code(out, COAP_RESPONSE_CODE_CONTENT);
@@ -337,6 +353,57 @@ static void coap_cert_chain_handler(struct coap_resource_t* resource,
 	if (ret == 0)
 		fprintf(stderr, "Err: cannot response.\n");
 
+}
+
+static void coap_csr_handler(struct coap_resource_t* resource,
+			     struct coap_session_t* session,
+			     const struct coap_pdu_t* in,
+			     const struct coap_string_t* query,
+			     struct coap_pdu_t* out)
+{
+	int ret;
+	size_t len, total, offset;
+	static UsefulBuf ub;
+	const uint8_t *data;
+
+	printf("Received message: %s\n", coap_get_uri_path(in)->s);
+
+	coap_get_data_large(in, &len, &data, &offset, &total);
+
+	/* First PDU */
+	if (UsefulBuf_IsNULLOrEmpty(ub)) {
+		ub.ptr = malloc(total);
+		ub.len = total;
+	}
+
+	memcpy((uint8_t *)ub.ptr + offset, data, len);
+
+	/* Last PDU */
+	if (total == offset + len) {
+		/* Prepare and send response */
+		/* Will be used by asynchronous callback, can't be on stack */
+		static UsefulBuf ub2;
+		ub2 = create_cert(ub, 365);
+
+		coap_pdu_set_code(out, COAP_RESPONSE_CODE_CREATED);
+		ret = coap_add_data_large_response(resource,
+						   session,
+						   in,
+						   out,
+						   query,
+						   COAP_MEDIATYPE_APPLICATION_OCTET_STREAM,
+						   -1,
+						   0,
+						   ub2.len,
+						   ub2.ptr,
+						   coap_OPENSSL_free_wrapper,
+						   &ub2);
+		free(ub.ptr);
+		ub = NULLUsefulBuf;
+		ub2 = NULLUsefulBuf;
+		if (ret == 0)
+			fprintf(stderr, "Err: cannot response.\n");
+	}
 }
 
 void add_resource_wrapper(struct coap_context_t* coap_context,
@@ -425,7 +492,9 @@ int main(int argc, char *argv[])
 	/* register CoAP resource and resource handler */
 	printf("Registering CoAP resources.\n");
 	add_resource_wrapper(coap_context, COAP_REQUEST_FETCH, "cert_chain",
-	                     coap_cert_chain_handler);
+			     coap_cert_chain_handler);
+	add_resource_wrapper(coap_context, COAP_REQUEST_POST, "csr",
+			     coap_csr_handler);
 
 	/* enter main loop */
 	printf("Entering main loop.\n");
