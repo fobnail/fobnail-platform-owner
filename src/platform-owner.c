@@ -318,6 +318,7 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 		ub.len = len;
 	}
 
+	X509_REQ_free(req);
 	X509_free(ret);
 	fclose(po_priv);
 
