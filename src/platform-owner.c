@@ -191,8 +191,23 @@ static void add_basic_constraints(X509 *x509)
 
 static void add_key_usage(X509 *x509)
 {
-	/* TODO */
-	(void)x509;
+	ASN1_BIT_STRING *bs = NULL;
+	ASN1_OCTET_STRING *ext_oct = NULL;
+	X509_EXTENSION *ext = NULL;
+
+	bs = ASN1_BIT_STRING_new();
+	/* Bit 0 is digitalSignature */
+	ASN1_BIT_STRING_set_bit(bs, 0, 1);
+
+	ext_oct = ASN1_OCTET_STRING_new();
+	ext_oct->length = i2d_ASN1_BIT_STRING(bs, &ext_oct->data);
+
+	ext = X509_EXTENSION_create_by_NID(NULL, NID_key_usage, 1, ext_oct);
+	X509_add_ext(x509, ext, X509_get_ext_count(x509));
+
+	X509_EXTENSION_free(ext);
+	ASN1_OCTET_STRING_free(ext_oct);
+	ASN1_BIT_STRING_free(bs);
 }
 
 static ASN1_OCTET_STRING *get_keyid(X509_PUBKEY *pubkey)
