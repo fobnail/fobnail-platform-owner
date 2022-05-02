@@ -25,6 +25,10 @@ struct {
 	char *po_priv_filename;
 } args;
 
+#ifndef X509_VERSION_3
+#define X509_VERSION_3 2
+#endif
+
 static void signal_handler(int signum)
 {
 	quit = signum;
@@ -185,8 +189,19 @@ static void add_serial(X509 *x509)
 
 static void add_basic_constraints(X509 *x509)
 {
-	/* TODO */
-	(void)x509;
+	BASIC_CONSTRAINTS bc = { .ca = 0};
+	ASN1_OCTET_STRING *ext_oct = NULL;
+	X509_EXTENSION *ext = NULL;
+
+	ext_oct = ASN1_OCTET_STRING_new();
+	ext_oct->length = i2d_BASIC_CONSTRAINTS(&bc, &ext_oct->data);
+
+	ext = X509_EXTENSION_create_by_NID(NULL, NID_basic_constraints, 1,
+					   ext_oct);
+	X509_add_ext(x509, ext, X509_get_ext_count(x509));
+
+	X509_EXTENSION_free(ext);
+	ASN1_OCTET_STRING_free(ext_oct);
 }
 
 static void add_key_usage(X509 *x509)
@@ -296,7 +311,7 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	req = d2i_X509_REQ(NULL, (const unsigned char **)&tmp_ptr, csr.len);
 
 	X509 *ret = X509_new();
-	X509_set_version(ret, 2);
+	X509_set_version(ret, X509_VERSION_3);
 	X509_NAME *xn = X509_REQ_get_subject_name(req);
 	X509_set_subject_name(ret, xn);
 	X509_set_issuer_name(ret, issuer_name);
