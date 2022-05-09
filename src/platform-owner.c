@@ -295,6 +295,7 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	X509_REQ *req;
 	ASN1_TIME *tm;
 	UsefulBuf ub = NULLUsefulBuf;
+	X509 *ret = NULL;
 	/* Pointer to buffer is modified by d2i_* functions, make a copy */
 	unsigned char *tmp_ptr = csr.ptr;
 	/* UsefulBuf.len is unsigned and i2d_* return negative value on error */
@@ -309,10 +310,19 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	pkey = PEM_read_PrivateKey(po_priv, NULL, NULL, NULL);
 
 	req = d2i_X509_REQ(NULL, (const unsigned char **)&tmp_ptr, csr.len);
+	if (!req) {
+		fprintf(stderr, "Invalid CSR\n");
+		goto exit;
+	}
 
-	X509 *ret = X509_new();
+	ret = X509_new();
 	X509_set_version(ret, X509_VERSION_3);
 	X509_NAME *xn = X509_REQ_get_subject_name(req);
+	if (!xn) {
+		fprintf(stderr, "X509_REQ_get_subject_name failed\n");
+		goto exit;
+	}
+
 	X509_set_subject_name(ret, xn);
 	X509_set_issuer_name(ret, issuer_name);
 	tm = ASN1_TIME_adj(NULL, time(NULL), 0, 0);
@@ -321,7 +331,12 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	X509_set1_notAfter(ret, tm);
 	ASN1_STRING_free(tm);
 
-	X509_set_pubkey(ret, X509_REQ_get0_pubkey(req));
+	EVP_PKEY *pubkey = X509_REQ_get0_pubkey(req);
+	if (!pubkey) {
+		fprintf(stderr, "X509_REQ_get0_pubkey failed\n");
+		goto exit;
+	}
+	X509_set_pubkey(ret, pubkey);
 
 	add_serial(ret);
 
@@ -331,7 +346,7 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	add_akid(ret, pkey);
 
 	/* TODO: blindly issuing certificates might be dangerous, add tests */
-	X509_sign(ret, pkey, EVP_sha256());
+	X509_sign(ret, pkey, EVP_md_null());
 
 	/* Following line won't even get called when error happens earlier */
 	ERR_print_errors_fp(stdout);
@@ -348,8 +363,11 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 		ub.len = len;
 	}
 
-	X509_REQ_free(req);
-	X509_free(ret);
+exit:
+	if (req)
+		X509_REQ_free(req);
+	if (ret)
+		X509_free(ret);
 	fclose(po_priv);
 
 	return ub;
