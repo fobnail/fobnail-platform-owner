@@ -296,6 +296,8 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	ASN1_TIME *tm;
 	UsefulBuf ub = NULLUsefulBuf;
 	X509 *ret = NULL;
+	int nid = NID_undef;
+	const EVP_MD *md = EVP_md_null();
 	/* Pointer to buffer is modified by d2i_* functions, make a copy */
 	unsigned char *tmp_ptr = csr.ptr;
 	/* UsefulBuf.len is unsigned and i2d_* return negative value on error */
@@ -345,8 +347,12 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	add_skid(ret);
 	add_akid(ret, pkey);
 
+	/* EVP_get_digestbynid(NID_undef) returns NULL, not EVP_md_null()... */
+	if (EVP_PKEY_get_default_digest_nid(pkey, &nid) > 0 && nid != NID_undef)
+		md = EVP_get_digestbynid(nid);
+
 	/* TODO: blindly issuing certificates might be dangerous, add tests */
-	X509_sign(ret, pkey, EVP_md_null());
+	X509_sign(ret, pkey, md);
 
 	/* Following line won't even get called when error happens earlier */
 	ERR_print_errors_fp(stdout);
