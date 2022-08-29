@@ -4,8 +4,8 @@
 
 #include <stdio.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <coap3/coap.h>
-#include <signal.h>
 #include <qcbor/UsefulBuf.h>
 #include <qcbor/qcbor_encode.h>
 #include <openssl/err.h>
@@ -15,41 +15,26 @@
 #include <openssl/x509v3.h>
 #include <openssl/safestack.h>
 
-static volatile sig_atomic_t quit = 0;
-static const char LISTEN_ADDRESS[] = "0.0.0.0";
-static unsigned int port = COAP_DEFAULT_PORT; /* default port 5683 */
-static X509_NAME *issuer_name = NULL;
+/* getaddrinfo() expects those to be strings */
+#define COAP_SERVER_ADDR "169.254.0.1"
+#define COAP_SERVER_PORT "5683"
 
-struct {
-	char *chain_filename;
-	char *po_priv_filename;
-} args;
+#define MAX_URI_LEN 100
+
+#define UNUSED  __attribute__((unused))
+
+typedef struct {
+	char		*chain_filename;
+	char		*po_priv_filename;
+	X509_NAME	*issuer_name;
+	UsefulBuf	csr;
+} app_data_t;
 
 #ifndef X509_VERSION_3
 #define X509_VERSION_3 2
 #endif
 
-static void signal_handler(int signum)
-{
-	quit = signum;
-}
-
-static void coap_free_wrapper(coap_session_t *session, void *app_ptr)
-{
-	(void)session; /* unused */
-	if (app_ptr != NULL)
-		free(app_ptr);
-}
-
-static void coap_OPENSSL_free_wrapper(coap_session_t *session, void *app_ptr)
-{
-	(void)session; /* unused */
-	UsefulBuf *ub = app_ptr;
-	if (ub->ptr != NULL)
-		OPENSSL_clear_free(ub->ptr, ub->len);
-}
-
-static int get_cert_chain(UsefulBufC **certs)
+static int get_cert_chain(UsefulBufC **certs, app_data_t *app_data)
 {
 	int num_objects = 0;
 	int chain_size = 0;
@@ -62,9 +47,9 @@ static int get_cert_chain(UsefulBufC **certs)
 	store = X509_STORE_new();
 	lookup_ctx = X509_STORE_add_lookup(store, X509_LOOKUP_file());
 
-	if (!X509_LOOKUP_load_file(lookup_ctx, args.chain_filename, X509_FILETYPE_PEM)) {
+	if (!X509_LOOKUP_load_file(lookup_ctx, app_data->chain_filename, X509_FILETYPE_PEM)) {
 		fprintf(stderr, "Can't load certificates from '%s' - is file corrupted?\n",
-			args.chain_filename);
+			app_data->chain_filename);
 		goto error;
 	}
 
@@ -115,7 +100,7 @@ static int get_cert_chain(UsefulBufC **certs)
 		chain_size++;
 	}
 
-	issuer_name = X509_NAME_dup(xn_prev);
+	app_data->issuer_name = X509_NAME_dup(xn_prev);
 
 error:
 	/* Tear down X509 resources */
@@ -157,13 +142,13 @@ static UsefulBuf _cbor_cert_chain(UsefulBuf buf, size_t num, UsefulBufC *certs)
 	}
 }
 
-static UsefulBuf cbor_cert_chain(void)
+static UsefulBuf cbor_cert_chain(app_data_t *app_data)
 {
 	UsefulBufC *certs = NULL;
 	UsefulBuf ret = SizeCalculateUsefulBuf;
 	int num_certs;
 
-	num_certs = get_cert_chain(&certs);
+	num_certs = get_cert_chain(&certs, app_data);
 
 	ret = _cbor_cert_chain(ret, num_certs, certs);
 	ret.ptr = malloc(ret.len);
@@ -289,7 +274,7 @@ static void add_akid(X509 *x509, EVP_PKEY *ak_priv)
 	X509_PUBKEY_free(pubkey);
 }
 
-static UsefulBuf create_cert(UsefulBuf csr, long days)
+static UsefulBuf create_cert(app_data_t *app_data, long days)
 {
 	EVP_PKEY *pkey;
 	X509_REQ *req;
@@ -299,11 +284,11 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	int nid = NID_undef;
 	const EVP_MD *md = EVP_md_null();
 	/* Pointer to buffer is modified by d2i_* functions, make a copy */
-	unsigned char *tmp_ptr = csr.ptr;
+	unsigned char *tmp_ptr = app_data->csr.ptr;
 	/* UsefulBuf.len is unsigned and i2d_* return negative value on error */
 	int len = 0;
 
-	FILE *po_priv = fopen(args.po_priv_filename, "r");
+	FILE *po_priv = fopen(app_data->po_priv_filename, "r");
 	if (po_priv == NULL) {
 		perror("Can't open private CA key file");
 		return NULLUsefulBuf;
@@ -311,7 +296,7 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 
 	pkey = PEM_read_PrivateKey(po_priv, NULL, NULL, NULL);
 
-	req = d2i_X509_REQ(NULL, (const unsigned char **)&tmp_ptr, csr.len);
+	req = d2i_X509_REQ(NULL, (const unsigned char **)&tmp_ptr, app_data->csr.len);
 	if (!req) {
 		fprintf(stderr, "Invalid CSR\n");
 		goto exit;
@@ -326,7 +311,7 @@ static UsefulBuf create_cert(UsefulBuf csr, long days)
 	}
 
 	X509_set_subject_name(ret, xn);
-	X509_set_issuer_name(ret, issuer_name);
+	X509_set_issuer_name(ret, app_data->issuer_name);
 	tm = ASN1_TIME_adj(NULL, time(NULL), 0, 0);
 	X509_set1_notBefore(ret, tm);
 	tm = ASN1_TIME_adj(tm, time(NULL), days, 0);
@@ -379,120 +364,202 @@ exit:
 	return ub;
 }
 
-static void coap_cert_chain_handler(struct coap_resource_t* resource,
-				    struct coap_session_t* session,
-				    const struct coap_pdu_t* in,
-				    const struct coap_string_t* query,
-				    struct coap_pdu_t* out)
+static int resolve_address(coap_address_t *dst)
 {
-	int ret;
+    struct addrinfo *res, *ainfo;
+    struct addrinfo hints;
+    int status;
 
-	printf("Received message: %s\n", coap_get_uri_path(in)->s);
+    memset(&hints, 0, sizeof(hints));
+    memset(dst, 0, sizeof(*dst));
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_family = AF_UNSPEC;
 
-	UsefulBuf ub = cbor_cert_chain();
+    status = getaddrinfo(COAP_SERVER_ADDR, COAP_SERVER_PORT, &hints, &res);
 
-	/* prepare and send response */
-	coap_pdu_set_code(out, COAP_RESPONSE_CODE_CONTENT);
-	ret = coap_add_data_large_response(resource,
-					   session,
-					   in,
-					   out,
-					   query,
-					   COAP_MEDIATYPE_APPLICATION_CBOR,
-					   -1,
-					   0,
-					   ub.len,
-					   ub.ptr,
-					   coap_free_wrapper,
-					   ub.ptr);
-	if (ret == 0)
-		fprintf(stderr, "Err: cannot response.\n");
+    if (status != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(status));
+        return status;
+    }
 
+    for (ainfo = res; ainfo != NULL; ainfo = ainfo->ai_next) {
+        if (ainfo->ai_family == AF_INET || ainfo->ai_family == AF_INET6) {
+            dst->size = ainfo->ai_addrlen;
+            memcpy(&dst->addr.sin6, ainfo->ai_addr, dst->size);
+            break;
+        }
+    }
+
+    freeaddrinfo(res);
+
+    /* Return error if AF_INET* not found */
+    return ainfo == NULL;
 }
 
-static void coap_csr_handler(struct coap_resource_t* resource,
-			     struct coap_session_t* session,
-			     const struct coap_pdu_t* in,
-			     const struct coap_string_t* query,
-			     struct coap_pdu_t* out)
+static void split_and_add_uri(coap_pdu_t *pdu, const char *path)
 {
-	int ret;
-	size_t len, total, offset;
-	static UsefulBuf ub;
-	const uint8_t *data;
+	size_t len = MAX_URI_LEN;
+	unsigned char _buf[MAX_URI_LEN] = {0};
+	unsigned char *buf = _buf;
+	int res;
+	coap_optlist_t *optlist = NULL;
 
-	printf("Received message: %s\n", coap_get_uri_path(in)->s);
+	res = coap_split_path((const unsigned char*)path, strlen(path), buf, &len);
+	while (res--) {
+		coap_insert_optlist(&optlist,
+			coap_new_optlist(COAP_OPTION_URI_PATH,
+				     coap_opt_length(buf),
+				     coap_opt_value(buf)));
 
-	coap_get_data_large(in, &len, &data, &offset, &total);
+		buf += coap_opt_size(buf);
+	}
+	coap_add_optlist_pdu(pdu, &optlist);
+	coap_delete_optlist(optlist);
+}
 
-	/* First PDU */
+static coap_pdu_code_t response;
+
+/* NOTE: this function does not free memory allocated by payload */
+static int common_cbor_post(coap_context_t *ctx, coap_session_t *session,
+                            const char *path, UsefulBuf payload, int mediatype,
+                            coap_response_handler_t handler)
+{
+	coap_pdu_t *pdu = NULL;
+	int ret_response;
+	unsigned char buf[3];
+
+	/* Construct CoAP message */
+	pdu = coap_pdu_init(COAP_MESSAGE_CON,
+			COAP_REQUEST_CODE_POST,
+			coap_new_message_id(session),
+			coap_session_max_pdu_size(session));
+	if (!pdu) {
+		coap_log(LOG_EMERG, "%s: cannot create PDU\n", path);
+		return -1;
+	}
+
+	/* Add a Uri-Path option */
+	split_and_add_uri(pdu, path);
+
+	/* Add Content-Format option */
+	coap_add_option(pdu, COAP_OPTION_CONTENT_FORMAT,
+	                coap_encode_var_safe(buf, sizeof(buf), mediatype), buf);
+
+	/* Add data - must be after all options are added */
+	if (!coap_add_data_large_request(session, pdu, payload.len, payload.ptr,
+				     NULL, NULL)) {
+		coap_log(LOG_EMERG, "Couldn't add data to PDU\n");
+		free(payload.ptr);
+		coap_delete_pdu(pdu);
+		return -1;
+	}
+
+	coap_show_pdu(LOG_INFO, pdu);
+
+	coap_register_response_handler(ctx, handler);
+
+	/* Send the PDU (releases memory allocated for PDU) */
+	coap_send(session, pdu);
+
+	/* Wait for response */
+	while (response == 0)
+		coap_io_process(ctx, COAP_IO_WAIT);
+
+	/* Clear flag and unregister handler for further requests */
+	ret_response = response;
+	response = 0;
+	coap_register_response_handler(ctx, NULL);
+
+	return ret_response;
+}
+
+static coap_response_t provision_response_handler(coap_session_t UNUSED *session,
+                                               const coap_pdu_t UNUSED *sent,
+                                               const coap_pdu_t *received,
+                                               const coap_mid_t UNUSED mid)
+{
+	app_data_t *app_data = coap_session_get_app_data(session);
+	response = coap_pdu_get_code(received);
+	UsefulBufC ub = NULLUsefulBufC;
+
+	coap_show_pdu(LOG_INFO, received);
+
+	if (response != COAP_RESPONSE_CODE_CREATED)
+		return COAP_RESPONSE_OK;
+
+	if (!coap_get_data(received, &ub.len, (const uint8_t **)&ub.ptr)) {
+		coap_log(LOG_EMERG, "CSR doesn't contain any data\n");
+		return COAP_RESPONSE_OK;
+	}
+
+	app_data->csr.ptr = malloc(ub.len);
+	app_data->csr.len = ub.len;
+	memcpy(app_data->csr.ptr, ub.ptr, ub.len);
+
+	return COAP_RESPONSE_OK;
+}
+
+static int provision_request(coap_context_t *ctx, coap_session_t *session)
+{
+	app_data_t *app_data = coap_session_get_app_data(session);
+	const char path[] = "api/v1/admin/token_provision";
+	int ret = -1;
+
+	UsefulBuf ub = cbor_cert_chain(app_data);
 	if (UsefulBuf_IsNULLOrEmpty(ub)) {
-		ub.ptr = malloc(total);
-		ub.len = total;
+		return ret;
 	}
 
-	memcpy((uint8_t *)ub.ptr + offset, data, len);
+	ret = common_cbor_post(ctx, session, path, ub,
+	                       COAP_MEDIATYPE_APPLICATION_CBOR,
+	                       provision_response_handler);
 
-	/* Last PDU */
-	if (total == offset + len) {
-		/* Prepare and send response */
-		/* Will be used by asynchronous callback, can't be on stack */
-		static UsefulBuf ub2;
-		ub2 = create_cert(ub, 365);
+	free(ub.ptr);
+	return ret;
+}
 
-		coap_pdu_set_code(out, COAP_RESPONSE_CODE_CREATED);
-		ret = coap_add_data_large_response(resource,
-						   session,
-						   in,
-						   out,
-						   query,
-						   COAP_MEDIATYPE_APPLICATION_OCTET_STREAM,
-						   -1,
-						   0,
-						   ub2.len,
-						   ub2.ptr,
-						   coap_OPENSSL_free_wrapper,
-						   &ub2);
-		free(ub.ptr);
-		ub = NULLUsefulBuf;
-		ub2 = NULLUsefulBuf;
-		if (ret == 0)
-			fprintf(stderr, "Err: cannot response.\n");
+static coap_response_t finish_response_handler(coap_session_t UNUSED *session,
+                                               const coap_pdu_t UNUSED *sent,
+                                               const coap_pdu_t *received,
+                                               const coap_mid_t UNUSED mid)
+{
+	response = coap_pdu_get_code(received);
+
+	coap_show_pdu(LOG_INFO, received);
+
+	return COAP_RESPONSE_OK;
+}
+
+static int finish_request(coap_context_t *ctx, coap_session_t *session)
+{
+	const char path[] = "api/v1/admin/provision_complete";
+	app_data_t *app_data = coap_session_get_app_data(session);
+	int ret = -1;
+
+	UsefulBuf ub = create_cert(app_data, 365);
+	if (UsefulBuf_IsNULLOrEmpty(ub)) {
+		return -1;
 	}
-}
 
-void add_resource_wrapper(struct coap_context_t* coap_context,
-			  coap_request_t method, const char* resource_name,
-			  coap_method_handler_t handler)
-{
-	coap_str_const_t* resource_uri = coap_new_str_const((uint8_t const*)resource_name, strlen(resource_name));
-	coap_resource_t* resource =
-		coap_resource_init(resource_uri, COAP_RESOURCE_FLAGS_RELEASE_URI);
-	coap_register_handler(resource, method, handler);
-	coap_add_resource(coap_context, resource);
-}
+	ret = common_cbor_post(ctx, session, path, ub,
+	                       COAP_MEDIATYPE_APPLICATION_OCTET_STREAM,
+	                       finish_response_handler);
 
-coap_endpoint_t* coap_new_endpoint_wrapper(coap_context_t* coap_context,
-					   const char* listen_address,
-					   const uint16_t port,
-					   const coap_proto_t coap_protocol)
-{
-	/* prepare address */
-	coap_address_t addr = {0};
-	coap_address_init(&addr);
-	addr.addr.sin.sin_family = AF_INET;
-	inet_pton(AF_INET, listen_address, &addr.addr.sin.sin_addr);
-	addr.addr.sin.sin_port = htons(port);
-
-	/* create endpoint */
-	return coap_new_endpoint(coap_context, &addr, coap_protocol);
+	free(app_data->csr.ptr);
+	app_data->csr = NULLUsefulBuf;
+	OPENSSL_clear_free(ub.ptr, ub.len);
+	return ret;
 }
 
 /* --------------------------- main ----------------------------- */
 
 int main(int argc, char *argv[])
 {
+	coap_context_t  *ctx = NULL;
+	coap_session_t *session = NULL;
+	coap_address_t dst;
 	int result = EXIT_SUCCESS;
+	app_data_t app_data = {0};
 
 	/* TODO: parse CLI arguments with getopt if needed */
 	if (argc < 3) {
@@ -507,7 +574,7 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	} else {
 		fclose(f);
-		args.chain_filename = argv[1];
+		app_data.chain_filename = argv[1];
 	}
 
 	f = fopen(argv[2], "r");
@@ -517,61 +584,59 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	} else {
 		fclose(f);
-		args.po_priv_filename = argv[2];
+		app_data.po_priv_filename = argv[2];
 	}
 
-	/* signal handling */
-	signal(SIGINT, signal_handler);
-	signal(SIGTERM, signal_handler);
+	coap_startup();
 
-	coap_context_t* coap_context = NULL;
-	coap_endpoint_t* coap_endpoint = NULL;
+	/* Set logging level */
+	coap_set_log_level(LOG_DEBUG);
 
-	coap_context = coap_new_context(NULL);
-	if (coap_context == NULL) {
-		printf("Cannot create CoAP context.\n");
-		result = EXIT_FAILURE;
-		goto error;
-	}
-	/* enable block handling by libcoap */
-	coap_context_set_block_mode(coap_context, COAP_BLOCK_USE_LIBCOAP | COAP_BLOCK_SINGLE_BODY);
-
-	printf("Creating CoAP server endpoint using UDP.\n");
-	if ((coap_endpoint = coap_new_endpoint_wrapper(coap_context, LISTEN_ADDRESS,
-		port, COAP_PROTO_UDP)) == NULL) {
-		printf("Cannot create CoAP server endpoint based on UDP.\n");
-		result = EXIT_FAILURE;
-		goto error;
+	/* Resolve destination address where server should be sent */
+	if (resolve_address(&dst)) {
+		coap_log(LOG_CRIT, "Failed to resolve address\n");
+		goto finish;
 	}
 
-	/* register CoAP resource and resource handler */
-	printf("Registering CoAP resources.\n");
-	add_resource_wrapper(coap_context, COAP_REQUEST_FETCH, "cert_chain",
-			     coap_cert_chain_handler);
-	add_resource_wrapper(coap_context, COAP_REQUEST_POST, "csr",
-			     coap_csr_handler);
+	/* Create CoAP context and a client session */
+	if (!(ctx = coap_new_context(NULL))) {
+		coap_log(LOG_EMERG, "Cannot create libcoap context\n");
+		goto finish;
+	}
+	/* Support large responses */
+	coap_context_set_block_mode(ctx,
+		  COAP_BLOCK_USE_LIBCOAP | COAP_BLOCK_SINGLE_BODY);
 
-	/* enter main loop */
-	printf("Entering main loop.\n");
-	while (!quit) {
-		/* process CoAP I/O */
-		if (coap_io_process(coap_context, COAP_IO_WAIT) == -1) {
-			printf("Error during CoAP I/O processing.\n");
-			result = EXIT_FAILURE;
-			quit = 1;
-		}
+	if (!(session = coap_new_client_session(ctx, NULL, &dst,
+						  COAP_PROTO_UDP))) {
+	coap_log(LOG_EMERG, "Cannot create client session\n");
+		goto finish;
 	}
 
-error:
-	if (issuer_name)
-		X509_NAME_free(issuer_name);
+	coap_session_set_app_data(session, &app_data);
 
-	/* free CoAP memory */
-	coap_free_endpoint(coap_endpoint);
-	coap_endpoint = NULL;
-	coap_free_context(coap_context);
-	coap_context = NULL;
+	result = provision_request(ctx, session);
+	if (result != COAP_RESPONSE_CODE_CREATED) {
+		coap_log(LOG_EMERG, "Unexpected response for provision request (%s)\n",
+		         (result > 0 && coap_response_phrase((uint8_t)result)) ?
+		         coap_response_phrase((uint8_t)result) : "not a CoAP error");
+		goto finish;
+	}
 
+	result = finish_request(ctx, session);
+	if (result != COAP_RESPONSE_CODE_CREATED) {
+		coap_log(LOG_EMERG, "Unexpected response for provision complete request (%s)\n",
+		         (result > 0 && coap_response_phrase((uint8_t)result)) ?
+		         coap_response_phrase((uint8_t)result) : "not a CoAP error");
+		goto finish;
+	}
+
+finish:
+	if (app_data.issuer_name)
+		X509_NAME_free(app_data.issuer_name);
+
+	coap_session_release(session);
+	coap_free_context(ctx);
 	coap_cleanup();
 
 	return result;
